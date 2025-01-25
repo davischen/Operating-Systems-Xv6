@@ -1,0 +1,23 @@
+--- src/sysproc.c	2023-03-02 13:19:03.997870448 +0000
++++ src-finished/sysproc.c	2023-03-02 13:19:03.893869621 +0000
+@@ -7,6 +7,10 @@
+ #include "mmu.h"
+ #include "proc.h"
+ 
++
++int readcount=0;
++
++
+ int
+ sys_fork(void)
+ {
+@@ -89,3 +93,9 @@
+   release(&tickslock);
+   return xticks;
+ }
++
++int
++sys_getreadcount(void)
++{
++  return readcount;
++}

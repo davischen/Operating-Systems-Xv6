@@ -1,0 +1,83 @@
+diff -ruN src/syscall.c src-finished/syscall.c
+--- src/syscall.c	2023-03-02 13:19:03.997870448 +0000
++++ src-finished/syscall.c	2023-03-02 13:19:03.881869526 +0000
+@@ -103,6 +103,8 @@
+ extern int sys_wait(void);
+ extern int sys_write(void);
+ extern int sys_uptime(void);
++extern int sys_getreadcount(void);
++extern int readcount ;
+ 
+ static int (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -126,6 +128,7 @@
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_getreadcount] sys_getreadcount
+ };
+ 
+ void
+@@ -136,6 +139,10 @@
+ 
+   num = curproc->tf->eax;
+   if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
++    if (num == SYS_read)
++    {
++      readcount++;
++    }
+     curproc->tf->eax = syscalls[num]();
+   } else {
+     cprintf("%d %s: unknown sys call %d\n",
+diff -ruN src/syscall.h src-finished/syscall.h
+--- src/syscall.h	2023-03-02 13:19:03.997870448 +0000
++++ src-finished/syscall.h	2023-03-02 13:19:03.885869558 +0000
+@@ -20,3 +20,4 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_getreadcount 22
+diff -ruN src/sysproc.c src-finished/sysproc.c
+--- src/sysproc.c	2023-03-02 13:19:03.997870448 +0000
++++ src-finished/sysproc.c	2023-03-02 13:19:03.893869621 +0000
+@@ -7,6 +7,10 @@
+ #include "mmu.h"
+ #include "proc.h"
+ 
++
++int readcount=0;
++
++
+ int
+ sys_fork(void)
+ {
+@@ -89,3 +93,9 @@
+   release(&tickslock);
+   return xticks;
+ }
++
++int
++sys_getreadcount(void)
++{
++  return readcount;
++}
+diff -ruN src/user.h src-finished/user.h
+--- src/user.h	2023-03-02 13:19:03.997870448 +0000
++++ src-finished/user.h	2023-03-02 13:19:03.905869717 +0000
+@@ -23,6 +23,7 @@
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int getreadcount(void);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff -ruN src/usys.S src-finished/usys.S
+--- src/usys.S	2023-03-02 13:19:03.997870448 +0000
++++ src-finished/usys.S	2023-03-02 13:19:03.909869748 +0000
+@@ -29,3 +29,4 @@
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++SYSCALL(getreadcount)
+\ No newline at end of file

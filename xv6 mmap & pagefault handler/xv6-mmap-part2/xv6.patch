@@ -1,0 +1,626 @@
+diff -ruN src/defs.h src-finished/defs.h
+--- src/defs.h	2023-03-27 00:21:07.222601341 +0000
++++ src-finished/defs.h	2023-03-27 00:20:46.850320954 +0000
+@@ -69,6 +69,10 @@
+ void            kinit1(void*, void*);
+ void            kinit2(void*, void*);
+ 
++// kmalloc.c
++void*           kmalloc(uint);
++void            kmfree(void*);
++
+ // kbd.c
+ void            kbdintr(void);
+ 
+@@ -120,6 +124,8 @@
+ int             wait(void);
+ void            wakeup(void*);
+ void            yield(void);
++void*           mmap(void*, uint, int, int, int, int);
++int             munmap(void*, uint);
+ 
+ // swtch.S
+ void            swtch(struct context**, struct context*);
+@@ -175,7 +181,8 @@
+ void            kvmalloc(void);
+ pde_t*          setupkvm(void);
+ char*           uva2ka(pde_t*, char*);
+-int             allocuvm(pde_t*, uint, uint);
++int             allocuvm_mmap(pde_t*, uint, uint);
++int             allocuvm_proc(pde_t*, uint, uint);
+ int             deallocuvm(pde_t*, uint, uint);
+ void            freevm(pde_t*);
+ void            inituvm(pde_t*, char*, uint);
+diff -ruN src/exec.c src-finished/exec.c
+--- src/exec.c	2023-03-27 00:21:07.222601341 +0000
++++ src-finished/exec.c	2023-03-27 00:20:46.854321010 +0000
+@@ -49,7 +49,7 @@
+       goto bad;
+     if(ph.vaddr + ph.memsz < ph.vaddr)
+       goto bad;
+-    if((sz = allocuvm(pgdir, sz, ph.vaddr + ph.memsz)) == 0)
++    if((sz = allocuvm_proc(pgdir, sz, ph.vaddr + ph.memsz)) == 0)
+       goto bad;
+     if(ph.vaddr % PGSIZE != 0)
+       goto bad;
+@@ -63,7 +63,7 @@
+   // Allocate two pages at the next page boundary.
+   // Make the first inaccessible.  Use the second as the user stack.
+   sz = PGROUNDUP(sz);
+-  if((sz = allocuvm(pgdir, sz, sz + 2*PGSIZE)) == 0)
++  if((sz = allocuvm_proc(pgdir, sz, sz + 2*PGSIZE)) == 0)
+     goto bad;
+   clearpteu(pgdir, (char*)(sz - 2*PGSIZE));
+   sp = sz;
+diff -ruN src/kmalloc.c src-finished/kmalloc.c
+--- src/kmalloc.c	1970-01-01 00:00:00.000000000 +0000
++++ src-finished/kmalloc.c	2023-03-27 00:20:46.854321010 +0000
+@@ -0,0 +1,94 @@
++#include "types.h"
++#include "defs.h"
++#include "mmu.h"
++
++// Memory allocator by Kernighan and Ritchie,
++// The C programming Language, 2nd ed.  Section 8.7.
++// Modified for allocation in the kernel.
++
++typedef long Align;
++
++union header {
++  struct {
++    union header *ptr;
++    uint size;
++  } s;
++  Align x;
++};
++
++typedef union header Header;
++
++static Header base;
++static Header *freep;
++
++void
++kmfree(void *addr)
++{
++  Header *bp, *p;
++
++  bp = (Header*)addr - 1;
++  for(p = freep; !(bp > p && bp < p->s.ptr); p = p->s.ptr)
++    if(p >= p->s.ptr && (bp > p || bp < p->s.ptr))
++      break;
++  if(bp + bp->s.size == p->s.ptr){
++    bp->s.size += p->s.ptr->s.size;
++    bp->s.ptr = p->s.ptr->s.ptr;
++  } else
++    bp->s.ptr = p->s.ptr;
++  if(p + p->s.size == bp){
++    p->s.size += bp->s.size;
++    p->s.ptr = bp->s.ptr;
++  } else
++    p->s.ptr = bp;
++  freep = p;
++}
++
++static Header*
++morecore(uint nu)
++{
++  char *p;
++  Header *hp;
++
++  if (nu * sizeof(Header) > PGSIZE) {
++    panic("kmalloc: memory allocation too big");
++  }
++  if (PGSIZE % sizeof(Header) != 0) {
++    panic("kmalloc: memory allocation not (header) aligned");
++  }
++  if ((p = kalloc()) == (char*)0) {
++    panic("kmalloc: memory allocation failed");
++  }
++  hp = (Header*)p;
++  hp->s.size = PGSIZE / sizeof(Header);
++  kmfree((void*)(hp + 1));
++  return freep;
++}
++
++void*
++kmalloc(uint nbytes)
++{
++  Header *p, *prevp;
++  uint nunits;
++
++  nunits = (nbytes + sizeof(Header) - 1)/sizeof(Header) + 1;
++  if((prevp = freep) == 0){
++    base.s.ptr = freep = prevp = &base;
++    base.s.size = 0;
++  }
++  for(p = prevp->s.ptr; ; prevp = p, p = p->s.ptr){
++    if(p->s.size >= nunits){
++      if(p->s.size == nunits)
++        prevp->s.ptr = p->s.ptr;
++      else {
++        p->s.size -= nunits;
++        p += p->s.size;
++        p->s.size = nunits;
++      }
++      freep = prevp;
++      return (void*)(p + 1);
++    }
++    if(p == freep)
++      if((p = morecore(nunits)) == 0)
++        return 0;
++  }
++}
+diff -ruN src/Makefile src-finished/Makefile
+--- src/Makefile	2023-03-27 00:21:07.218601287 +0000
++++ src-finished/Makefile	2023-03-27 00:20:46.850320954 +0000
+@@ -7,6 +7,7 @@
+ 	ide.o\
+ 	ioapic.o\
+ 	kalloc.o\
++	kmalloc.o\
+ 	kbd.o\
+ 	lapic.o\
+ 	log.o\
+@@ -21,6 +22,7 @@
+ 	swtch.o\
+ 	syscall.o\
+ 	sysfile.o\
++	sysmalloc.o\
+ 	sysproc.o\
+ 	trapasm.o\
+ 	trap.o\
+diff -ruN src/memlayout.h src-finished/memlayout.h
+--- src/memlayout.h	2023-03-27 00:21:07.222601341 +0000
++++ src-finished/memlayout.h	2023-03-27 00:20:46.854321010 +0000
+@@ -13,3 +13,5 @@
+ 
+ #define V2P_WO(x) ((x) - KERNBASE)    // same as V2P, but without casts
+ #define P2V_WO(x) ((x) + KERNBASE)    // same as P2V, but without casts
++
++#define MMAPBASE 0x40000000
+diff -ruN src/proc.c src-finished/proc.c
+--- src/proc.c	2023-03-27 00:21:07.222601341 +0000
++++ src-finished/proc.c	2023-03-27 00:20:46.854321010 +0000
+@@ -20,6 +20,8 @@
+ 
+ static void wakeup1(void *chan);
+ 
++static void free_mmap_regions(struct mmap_region *mmap_regions);
++
+ void
+ pinit(void)
+ {
+@@ -142,6 +144,8 @@
+   safestrcpy(p->name, "initcode", sizeof(p->name));
+   p->cwd = namei("/");
+ 
++  p->mmap_regions = (struct mmap_region*)0;
++
+   // this assignment to p->state lets other cores
+   // run this process. the acquire forces the above
+   // writes to be visible, and the lock is also needed
+@@ -163,7 +167,7 @@
+ 
+   sz = curproc->sz;
+   if(n > 0){
+-    if((sz = allocuvm(curproc->pgdir, sz, sz + n)) == 0)
++    if((sz = allocuvm_proc(curproc->pgdir, sz, sz + n)) == 0)
+       return -1;
+   } else if(n < 0){
+     if((sz = deallocuvm(curproc->pgdir, sz, sz + n)) == 0)
+@@ -183,14 +187,44 @@
+   int i, pid;
+   struct proc *np;
+   struct proc *curproc = myproc();
++  struct mmap_region *mmap, *new_mmap, *prev_mmap;
+ 
+   // Allocate process.
+   if((np = allocproc()) == 0){
+     return -1;
+   }
+ 
++  // Copy the mmap regions.
++  for(mmap = curproc->mmap_regions, prev_mmap = (struct mmap_region*)0;
++      mmap != (struct mmap_region*)0;
++      mmap = mmap->next_mmap_region, prev_mmap = new_mmap){
++    if((new_mmap = kmalloc(sizeof(struct mmap_region))) ==
++       (struct mmap_region*)0){
++      free_mmap_regions(np->mmap_regions);
++      np->mmap_regions = (struct mmap_region*)0;
++      kfree(np->kstack);
++      np->kstack = 0;
++      np->state = UNUSED;
++      return -1;
++    }
++    new_mmap->start_addr = mmap->start_addr;
++    new_mmap->length = mmap->length;
++    new_mmap->prot = mmap->prot;
++    new_mmap->flags = mmap->flags;
++    new_mmap->fd = mmap->fd;
++    new_mmap->offset = mmap->offset;
++    new_mmap->next_mmap_region = (struct mmap_region*)0;
++    if(prev_mmap != (struct mmap_region*)0){
++      prev_mmap->next_mmap_region = new_mmap;
++    } else{
++      np->mmap_regions = new_mmap;
++    }
++  }
++
+   // Copy process state from proc.
+   if((np->pgdir = copyuvm(curproc->pgdir, curproc->sz)) == 0){
++    free_mmap_regions(np->mmap_regions);
++    np->mmap_regions = (struct mmap_region*)0;
+     kfree(np->kstack);
+     np->kstack = 0;
+     np->state = UNUSED;
+@@ -295,6 +329,8 @@
+         p->name[0] = 0;
+         p->killed = 0;
+         p->state = UNUSED;
++        free_mmap_regions(p->mmap_regions);
++        p->mmap_regions = (struct mmap_region*)0;
+         release(&ptable.lock);
+         return pid;
+       }
+@@ -496,6 +532,106 @@
+   return -1;
+ }
+ 
++void*
++mmap(void* addr, uint length, int prot, int flags, int fd, int offset)
++{
++  struct mmap_region *mmap;
++  struct proc *curproc = myproc();
++  int bad_addr;
++
++  addr = (void*)PGROUNDUP((uint)addr + MMAPBASE);
++  if ((uint)addr >= KERNBASE ||
++      (uint)addr + PGROUNDUP(length) >= KERNBASE) {
++    addr = (void*)MMAPBASE;
++    if ((uint)addr + PGROUNDUP(length) >= KERNBASE) {
++      return (void*)0;
++    }
++  }
++  for (mmap = curproc->mmap_regions; mmap != (struct mmap_region*)0
++         ;) {
++    bad_addr = 0;
++    if ((uint)addr >= (uint)mmap->start_addr &&
++        (uint)mmap->start_addr + PGROUNDUP(mmap->length) >= (uint)addr) {
++      bad_addr = 1;
++    }
++    if ((uint)mmap->start_addr >= (uint)addr &&
++        (uint)addr + PGROUNDUP(length) >= (uint)mmap->start_addr) {
++      bad_addr = 1;
++    }
++    if (bad_addr) {
++      addr = (void*)(mmap->start_addr + PGROUNDUP(mmap->length) + PGSIZE);
++      mmap = curproc->mmap_regions;
++      continue;
++    }
++    mmap = mmap->next_mmap_region;
++  }
++  if ((uint)addr >= KERNBASE ||
++      (uint)addr + PGROUNDUP(length) >= KERNBASE) {
++    return (void*)0;
++  }
++  if (allocuvm_mmap(curproc->pgdir, (uint)addr, (uint)addr + length) == 0) {
++    return (void*)0;
++  }
++  if ((mmap = kmalloc(sizeof(struct mmap_region))) ==
++      (struct mmap_region*)0) {
++    deallocuvm(curproc->pgdir, (uint)addr + length, (uint)addr);
++    return (void*)0;
++  }
++  mmap->start_addr = (uint)addr;
++  mmap->length = length;
++  mmap->prot = prot;
++  mmap->flags = flags;
++  mmap->fd = fd;
++  mmap->offset = offset;
++  mmap->next_mmap_region = curproc->mmap_regions;
++  curproc->mmap_regions = mmap;
++  return addr;
++}
++
++int
++munmap(void *addr, uint length)
++{
++  struct mmap_region *mmap, *prev_mmap;
++  struct proc *curproc = myproc();
++
++  for (mmap = curproc->mmap_regions, prev_mmap = (struct mmap_region*)0;
++       mmap != (struct mmap_region*)0;
++       prev_mmap = mmap, mmap = mmap->next_mmap_region) {
++    if ((uint)addr == (uint)mmap->start_addr && length == mmap->length) {
++      deallocuvm(curproc->pgdir, (uint)addr + length, (uint)addr);
++      if (prev_mmap != (struct mmap_region*)0) {
++        prev_mmap->next_mmap_region = mmap->next_mmap_region;
++      } else {
++        curproc->mmap_regions = mmap->next_mmap_region;
++      }
++      kmfree(mmap);
++      return 0;
++    }
++  }
++  return -1;
++}
++
++static void
++free_mmap_regions(struct mmap_region *mmap_regions)
++{
++  struct mmap_region *mmap;
++
++  for(mmap = mmap_regions; mmap != (struct mmap_region*)0;
++      mmap = mmap->next_mmap_region){
++    mmap->start_addr = 0;
++    mmap->length = 0;
++    mmap->prot = 0;
++    mmap->flags = 0;
++    mmap->fd = 0;
++    mmap->offset = 0;
++  }
++  while(mmap_regions != (struct mmap_region*)0){
++    mmap = mmap_regions;
++    mmap_regions = mmap->next_mmap_region;
++    kmfree(mmap);
++  }
++}
++
+ //PAGEBREAK: 36
+ // Print a process listing to console.  For debugging.
+ // Runs when user types ^P on console.
+diff -ruN src/proc.h src-finished/proc.h
+--- src/proc.h	2023-03-27 00:21:07.222601341 +0000
++++ src-finished/proc.h	2023-03-27 00:20:46.850320954 +0000
+@@ -34,6 +34,19 @@
+ 
+ enum procstate { UNUSED, EMBRYO, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
+ 
++// Per-process mmap
++struct mmap_region {
++  uint start_addr;             // Starting address (page aligned)
++  uint length;                 // Size of mmap
++  int prot;                    // Memory protections
++  int flags;                   // Region type (anonymous vs. file-backed)
++  int fd;                      // File-backed memory region
++  int offset;                  // Offset into file-backed memory region
++
++  // Next mmap region
++  struct mmap_region *next_mmap_region;
++};
++
+ // Per-process state
+ struct proc {
+   uint sz;                     // Size of process memory (bytes)
+@@ -49,6 +62,9 @@
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++
++  // Mmap regions
++  struct mmap_region *mmap_regions;
+ };
+ 
+ // Process memory is laid out contiguously, low addresses first:
+diff -ruN src/syscall.c src-finished/syscall.c
+--- src/syscall.c	2023-03-27 00:21:07.222601341 +0000
++++ src-finished/syscall.c	2023-03-27 00:20:46.850320954 +0000
+@@ -103,6 +103,10 @@
+ extern int sys_wait(void);
+ extern int sys_write(void);
+ extern int sys_uptime(void);
++extern int sys_kmalloc(void);
++extern int sys_kmfree(void);
++extern int sys_mmap(void);
++extern int sys_munmap(void);
+ 
+ static int (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -126,6 +130,10 @@
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_kmalloc] sys_kmalloc,
++[SYS_kmfree]  sys_kmfree,
++[SYS_mmap]    sys_mmap,
++[SYS_munmap]  sys_munmap,
+ };
+ 
+ void
+diff -ruN src/syscall.h src-finished/syscall.h
+--- src/syscall.h	2023-03-27 00:21:07.222601341 +0000
++++ src-finished/syscall.h	2023-03-27 00:20:46.850320954 +0000
+@@ -1,22 +1,26 @@
+ // System call numbers
+-#define SYS_fork    1
+-#define SYS_exit    2
+-#define SYS_wait    3
+-#define SYS_pipe    4
+-#define SYS_read    5
+-#define SYS_kill    6
+-#define SYS_exec    7
+-#define SYS_fstat   8
+-#define SYS_chdir   9
+-#define SYS_dup    10
+-#define SYS_getpid 11
+-#define SYS_sbrk   12
+-#define SYS_sleep  13
+-#define SYS_uptime 14
+-#define SYS_open   15
+-#define SYS_write  16
+-#define SYS_mknod  17
+-#define SYS_unlink 18
+-#define SYS_link   19
+-#define SYS_mkdir  20
+-#define SYS_close  21
++#define SYS_fork     1
++#define SYS_exit     2
++#define SYS_wait     3
++#define SYS_pipe     4
++#define SYS_read     5
++#define SYS_kill     6
++#define SYS_exec     7
++#define SYS_fstat    8
++#define SYS_chdir    9
++#define SYS_dup     10
++#define SYS_getpid  11
++#define SYS_sbrk    12
++#define SYS_sleep   13
++#define SYS_uptime  14
++#define SYS_open    15
++#define SYS_write   16
++#define SYS_mknod   17
++#define SYS_unlink  18
++#define SYS_link    19
++#define SYS_mkdir   20
++#define SYS_close   21
++#define SYS_kmalloc 22
++#define SYS_kmfree  23
++#define SYS_mmap    24
++#define SYS_munmap  25
+diff -ruN src/sysmalloc.c src-finished/sysmalloc.c
+--- src/sysmalloc.c	1970-01-01 00:00:00.000000000 +0000
++++ src-finished/sysmalloc.c	2023-03-27 00:20:46.854321010 +0000
+@@ -0,0 +1,31 @@
++//
++// Kernel memory system calls.
++// This is purely for testing purposes and is a wrapper for
++// calling the kmalloc & kmfree from the user space.
++//
++
++#include "types.h"
++#include "defs.h"
++
++int
++sys_kmalloc(void)
++{
++  int nbytes;
++
++  if (argint(0, &nbytes) < 0) {
++    return -1;
++  }
++  return (int)kmalloc((uint)nbytes);
++}
++
++int
++sys_kmfree(void)
++{
++  void *addr;
++
++  if (argptr(0, (void*)&addr, sizeof(addr)) < 0) {
++    return -1;
++  }
++  kmfree(addr);
++  return 0;
++}
+diff -ruN src/sysproc.c src-finished/sysproc.c
+--- src/sysproc.c	2023-03-27 00:21:07.222601341 +0000
++++ src-finished/sysproc.c	2023-03-27 00:20:46.850320954 +0000
+@@ -89,3 +89,43 @@
+   release(&tickslock);
+   return xticks;
+ }
++
++int
++sys_mmap(void)
++{
++  int addr, len, prot, flags, fd, offset;
++
++  if (argint(0, &addr) < 0) {
++    return 0;
++  }
++  if (argint(1, &len) < 0) {
++    return 0;
++  }
++  if (argint(2, &prot) < 0) {
++    return 0;
++  }
++  if (argint(3, &flags) < 0) {
++    return 0;
++  }
++  if ((void*)addr != (void*)0 && argint(4, &fd) < 0) {
++    return 0;
++  }
++  if (argint(5, &offset) < 0) {
++    return 0;
++  }
++  return (int)mmap((void*)addr, (uint)len, prot, flags, fd, offset);
++}
++
++int
++sys_munmap(void)
++{
++  int addr, len;
++
++  if (argint(0, &addr) < 0) {
++    return -1;
++  }
++  if (argint(1, &len) < 0) {
++    return -1;
++  }
++  return munmap((void*)addr, (uint)len);
++}
+diff -ruN src/user.h src-finished/user.h
+--- src/user.h	2023-03-27 00:21:07.222601341 +0000
++++ src-finished/user.h	2023-03-27 00:20:46.850320954 +0000
+@@ -23,6 +23,10 @@
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++void* kmalloc(uint);
++void kmfree(void*);
++void* mmap(void*, uint, int, int, int, int);
++int munmap(void*, uint);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff -ruN src/usys.S src-finished/usys.S
+--- src/usys.S	2023-03-27 00:21:07.226601395 +0000
++++ src-finished/usys.S	2023-03-27 00:20:46.850320954 +0000
+@@ -29,3 +29,7 @@
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++SYSCALL(kmalloc)
++SYSCALL(kmfree)
++SYSCALL(mmap)
++SYSCALL(munmap)
+diff -ruN src/vm.c src-finished/vm.c
+--- src/vm.c	2023-03-27 00:21:07.226601395 +0000
++++ src-finished/vm.c	2023-03-27 00:20:46.850320954 +0000
+@@ -218,8 +218,8 @@
+ 
+ // Allocate page tables and physical memory to grow process from oldsz to
+ // newsz, which need not be page aligned.  Returns new size or 0 on error.
+-int
+-allocuvm(pde_t *pgdir, uint oldsz, uint newsz)
++static int
++allocuvm_ex(pde_t *pgdir, uint oldsz, uint newsz)
+ {
+   char *mem;
+   uint a;
+@@ -247,6 +247,24 @@
+   }
+   return newsz;
+ }
++int
++allocuvm_mmap(pde_t *pgdir, uint oldsz, uint newsz)
++{
++  if(oldsz < MMAPBASE) {
++    panic("allocuvm_mmap: invalid oldsz");
++    return 0;
++  }
++  return allocuvm_ex(pgdir, oldsz, newsz);
++}
++int
++allocuvm_proc(pde_t *pgdir, uint oldsz, uint newsz)
++{
++  if(newsz >= MMAPBASE) {
++    panic("allocuvm_proc: invalid newsz");
++    return 0;
++  }
++  return allocuvm_ex(pgdir, oldsz, newsz);
++}
+ 
+ // Deallocate user pages to bring the process size from oldsz to
+ // newsz.  oldsz and newsz need not be page-aligned, nor does newsz
